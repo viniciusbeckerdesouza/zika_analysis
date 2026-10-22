@@ -1,0 +1,38 @@
+# R e RStudio
+.Rhistory
+.RData
+.RDataTmp
+.Ruserdata
+.Rproj.user/
+
+# Biblioteca local e arquivos temporarios do renv
+renv/library/
+renv/staging/
+renv/local/
+renv/cache/
+renv/lock/
+renv/python/
+renv/sandbox/
+
+# Dados locais: manter apenas os marcadores dos diretorios
+/dados/brutos/*
+!/dados/brutos/.gitkeep
+/dados/processados/*
+!/dados/processados/.gitkeep
+/zika/
+/dados/populacao_municipios_*.rds
+/dados/populacao_municipios_*.csv
+
+# Caches e intermediarios do relatorio
+*_cache/
+*.knit.md
+*.utf8.md
+
+# Configuracoes locais e metadados auxiliares
+.env
+.env.*
+!.env.example
+.pubmed-search/
+*:sec.endpointdlp
+.DS_Store
+Thumbs.db

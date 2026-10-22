@@ -1,0 +1,780 @@
+---
+title: "Boletim Epidemiológico — Zika"
+subtitle: "Brasil, `r params$ano_inicio`–`r params$ano_fim`"
+author: "Autores: Breno Eduardo Lomazzi Cunha, Vinicius Becker de Souza"
+date: "Publicado em `r format(Sys.Date(), '%d/%m/%Y')`"
+lang: pt-BR
+params:
+  ano_inicio: 2015
+  ano_fim: 2025
+  dir_zika: "zika"
+  arquivo_pop: "dados/populacao_municipios_2015_2025.rds"
+  min_casos_ranking: 5
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    fig_caption: true
+  word_document:
+    toc: true
+    number_sections: true
+    fig_caption: true
+---
+
+<!--
+PRÉ-REQUISITOS (rodar uma vez, fora do boletim):
+  1. baixar_sinan("zika", 2015:2025, formato = "rds")  -> gera zika/ZIKA15.rds ... ZIKA25.rds
+  2. População SIDRA (tabela 6579) salva em dados/populacao_municipios_2015_2025.rds
+RENDERIZAR:
+  rmarkdown::render("boletim_zika.Rmd")                                  # HTML
+  rmarkdown::render("boletim_zika.Rmd", output_format = "word_document") # Word
+-->
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE, message = FALSE, warning = FALSE,
+  fig.align = "center", fig.width = 9, fig.height = 5, dpi = 150
+)
+
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(lubridate)
+  library(janitor)
+  library(scales)
+  library(knitr)
+  library(geobr)
+  library(sf)
+})
+
+anos <- params$ano_inicio:params$ano_fim
+
+# ---- Formatação pt-BR ----
+fmt_n <- function(x) formatC(round(x), format = "d", big.mark = ".")
+fmt_d <- function(x, d = 1) formatC(x, format = "f", digits = d,
+                                    big.mark = ".", decimal.mark = ",")
+fmt_p <- function(x, d = 1) paste0(fmt_d(x, d), "%")
+lab_n <- label_number(big.mark = ".", decimal.mark = ",")
+
+norm_txt <- function(x) {
+  x |>
+    as.character() |>
+    stringi::stri_trans_general("Latin-ASCII") |>
+    str_to_lower() |>
+    str_squish()
+}
+
+theme_set(
+  theme_minimal(base_size = 11) +
+    theme(
+      plot.title = element_text(face = "bold"),
+      legend.position = "bottom",
+      panel.grid.minor = element_blank()
+    )
+)
+
+cor_principal <- "#2878B5"
+cores_classif <- c(
+  "Confirmado"     = "#C0504D",
+  "Descartado"     = "#9BBB59",
+  "Inconclusivo"   = "#F79646",
+  "Sem informação" = "grey70",
+  "Outras"         = "grey40"
+)
+fonte_sinan <- "Fonte: SINAN/DATASUS. Dados sujeitos a revisão."
+fonte_inc   <- "Fonte: SINAN/DATASUS e IBGE (estimativas populacionais)."
+```
+
+```{r dados-sinan}
+# ---- Leitura dos arquivos anuais (tudo como texto para evitar conflito de tipos) ----
+arquivos <- file.path(sprintf("ZIKA%02d.rds", anos %% 100))
+arquivos <- arquivos[file.exists(arquivos)]
+if (length(arquivos) == 0) stop("Nenhum .rds encontrado em '", params$dir_zika, "'.")
+
+zika_raw <- map_dfr(arquivos, \(f) readRDS(f) |> mutate(across(everything(), as.character)))
+
+cols_necessarias <- c("DT_NOTIFIC", "DT_SIN_PRI", "CLASSI_FIN", "EVOLUCAO",
+                      "CS_SEXO", "CS_RACA", "CS_GESTANT", "ID_MN_RESI")
+for (cc in setdiff(cols_necessarias, names(zika_raw))) zika_raw[[cc]] <- NA_character_
+
+# ---- Idade em anos ----
+# ---- Idade em anos a partir de NU_IDADE_N (padrão SINAN) ----
+# 1º dígito = unidade (4 = anos, 3 = meses, 2 = dias, 1 = horas); 3 últimos = valor
+decodificar_idade <- function(x) {
+  x <- suppressWarnings(as.numeric(as.character(x)))
+  u <- x %/% 1000
+  v <- x %% 1000
+  case_when(
+    u == 4 ~ v,
+    u == 3 ~ v / 12,
+    u == 2 ~ v / 365,
+    u == 1 ~ 0,
+    TRUE   ~ NA_real_
+  )
+}
+
+idade_calc  <- decodificar_idade(zika_raw$NU_IDADE_N)
+fonte_idade <- "NU_IDADE_N"
+
+# ---- Recodificações ----
+rec_classif <- function(x) {
+  n <- norm_txt(x)
+  case_when(
+    is.na(n) | n == ""           ~ "Sem informação",
+    str_detect(n, "confirm")     ~ "Confirmado",
+    str_detect(n, "descart")     ~ "Descartado",
+    str_detect(n, "inconclus")   ~ "Inconclusivo",
+    TRUE                         ~ "Outras"
+  )
+}
+
+rec_sexo <- function(x) {
+  n <- norm_txt(x)
+  case_when(
+    str_detect(n, "^m") ~ "Masculino",
+    str_detect(n, "^f") ~ "Feminino",
+    str_detect(n, "^i") ~ "Ignorado",
+    TRUE                ~ "Sem informação"
+  )
+}
+
+rec_raca <- function(x) {
+  n <- norm_txt(x)
+  case_when(
+    is.na(n) | n == ""        ~ "Sem informação",
+    str_detect(n, "branca")   ~ "Branca",
+    str_detect(n, "preta")    ~ "Preta",
+    str_detect(n, "amarela")  ~ "Amarela",
+    str_detect(n, "parda")    ~ "Parda",
+    str_detect(n, "indigena") ~ "Indígena",
+    TRUE                      ~ "Ignorado"
+  )
+}
+
+rec_gestacao <- function(x) {
+  n <- norm_txt(x)
+  case_when(
+    is.na(n) | n == ""                ~ "Sem informação",
+    str_detect(n, "trimestre")        ~ paste0(str_extract(n, "[123]"), "º trimestre"),
+    str_detect(n, "idade gestacional") ~ "Idade gestacional ignorada",
+    str_detect(n, "nao se aplica")    ~ "Não se aplica",
+    n == "nao"                        ~ "Não gestante",
+    str_detect(n, "ignorad")          ~ "Ignorado",
+    TRUE                              ~ "Sem informação"
+  )
+}
+
+rec_evolucao <- function(x) {
+  n <- norm_txt(x)
+  case_when(
+    is.na(n) | n == "" | n == "0"             ~ "Sem informação",
+    n == "1" | str_detect(n, "cura")          ~ "Cura",
+    n == "3" | str_detect(n, "outra")         ~ "Óbito por outras causas",
+    n == "4" | str_detect(n, "investiga")     ~ "Óbito em investigação",
+    n == "2" | str_detect(n, "obito")         ~ "Óbito pelo agravo",
+    n == "9" | str_detect(n, "ignor")         ~ "Ignorado",
+    TRUE                                      ~ paste0("Outro: ", x)
+  )
+}
+
+niveis_faixa <- c("0–4", "5–11", "12–17", "18–29", "30–39",
+                  "40–49", "50–59", "60–69", "70+")
+
+zika <- zika_raw |>
+  mutate(
+    DT_NOTIFIC    = ymd(DT_NOTIFIC, quiet = TRUE),
+    DT_SIN_PRI    = ymd(DT_SIN_PRI, quiet = TRUE),
+    ANO           = year(coalesce(DT_SIN_PRI, DT_NOTIFIC)),
+    MES           = month(DT_SIN_PRI),
+    IDADE         = as.numeric(idade_calc),
+    IDADE         = if_else(between(IDADE, 0, 110), IDADE, NA_real_),
+    FAIXA         = cut(floor(IDADE),
+                        breaks = c(-Inf, 4, 11, 17, 29, 39, 49, 59, 69, Inf),
+                        labels = niveis_faixa),
+    CLASSIFICACAO = rec_classif(CLASSI_FIN),
+    SEXO          = rec_sexo(CS_SEXO),
+    RACA          = rec_raca(CS_RACA),
+    GESTACAO      = rec_gestacao(CS_GESTANT),
+    GESTANTE      = str_detect(GESTACAO, "trimestre|gestacional"),
+    EVOLUCAO_CAT  = rec_evolucao(EVOLUCAO),
+    ID_MN_RESI    = substr(str_extract(ID_MN_RESI, "\\d+"), 1, 6),
+    COD_UF        = substr(ID_MN_RESI, 1, 2)
+  ) |>
+  filter(ANO %in% anos)
+
+conf <- zika |> filter(CLASSIFICACAO == "Confirmado")
+```
+
+```{r dados-geo, cache=TRUE}
+# ---- Malhas e nomes (geobr, IBGE 2020) ----
+ufs_geo <- geobr::read_state(year = 2020, simplified = TRUE, showProgress = FALSE) |>
+  transmute(COD_UF = as.character(code_state), UF = abbrev_state, REGIAO = name_region)
+
+ufs_tab <- st_drop_geometry(ufs_geo)
+
+mun_nomes <- geobr::read_municipality(year = 2020, simplified = TRUE, showProgress = FALSE) |>
+  st_drop_geometry() |>
+  transmute(ID_MN_RESI = substr(as.character(code_muni), 1, 6),
+            MUNICIPIO  = name_muni,
+            UF         = abbrev_state) |>
+  distinct(ID_MN_RESI, .keep_all = TRUE)
+```
+
+```{r dados-pop}
+# ---- População municipal (SIDRA 6579) com interpolação de anos ausentes ----
+pop_mun <- readRDS(params$arquivo_pop) |>
+  transmute(
+    ID_MN_RESI = substr(as.character(`Município (Código)`), 1, 6),
+    ANO        = as.integer(Ano),
+    populacao  = as.numeric(Valor)
+  ) |>
+  filter(!is.na(populacao)) |>
+  distinct(ID_MN_RESI, ANO, .keep_all = TRUE)
+
+anos_pop_imputados <- setdiff(anos, unique(pop_mun$ANO))
+
+pop_mun <- pop_mun |>
+  group_by(ID_MN_RESI) |>
+  complete(ANO = anos) |>
+  mutate(populacao = if (sum(!is.na(populacao)) >= 2) {
+    approx(ANO[!is.na(populacao)], populacao[!is.na(populacao)],
+           xout = ANO, rule = 2)$y
+  } else {
+    coalesce(populacao, first(na.omit(populacao)))
+  }) |>
+  ungroup() |>
+  filter(ANO %in% anos, !is.na(populacao))
+
+pop_uf <- pop_mun |>
+  mutate(COD_UF = substr(ID_MN_RESI, 1, 2)) |>
+  group_by(COD_UF, ANO) |>
+  summarise(populacao = sum(populacao), .groups = "drop") |>
+  left_join(ufs_tab, by = "COD_UF")
+
+pop_br <- pop_mun |>
+  group_by(ANO) |>
+  summarise(populacao = sum(populacao), .groups = "drop")
+```
+
+```{r indicadores}
+# ---- Indicadores-chave ----
+inc_br <- pop_br |>
+  left_join(count(conf, ANO, name = "casos"), by = "ANO") |>
+  mutate(casos = replace_na(casos, 0L),
+         inc   = casos / populacao * 1e5)
+
+inc_uf <- pop_uf |>
+  left_join(count(conf, COD_UF, ANO, name = "casos"), by = c("COD_UF", "ANO")) |>
+  mutate(casos = replace_na(casos, 0L),
+         inc   = casos / populacao * 1e5)
+
+casos_mun <- conf |>
+  filter(!is.na(ID_MN_RESI)) |>
+  count(ID_MN_RESI, ANO, name = "casos")
+
+notif_ano <- zika |> count(ANO, name = "notificacoes")
+
+n_not      <- nrow(zika)
+n_conf     <- nrow(conf)
+pct_conf   <- n_conf / n_not * 100
+
+ano_pico   <- notif_ano$ANO[which.max(notif_ano$notificacoes)]
+n_pico     <- max(notif_ano$notificacoes)
+conf_pico  <- inc_br$casos[inc_br$ANO == ano_pico]
+inc_pico   <- inc_br$inc[inc_br$ANO == ano_pico]
+
+ano_ult    <- params$ano_fim
+conf_ult   <- inc_br$casos[inc_br$ANO == ano_ult]
+inc_ult    <- inc_br$inc[inc_br$ANO == ano_ult]
+conf_prev  <- inc_br$casos[inc_br$ANO == ano_ult - 1]
+var_ult    <- if (length(conf_prev) && conf_prev > 0) (conf_ult / conf_prev - 1) * 100 else NA
+
+uf_top_pico <- inc_uf |> filter(ANO == ano_pico) |> slice_max(inc, n = 1, with_ties = FALSE)
+
+n_gest_conf <- sum(conf$GESTANTE, na.rm = TRUE)
+
+n_obito_agravo <- sum(conf$EVOLUCAO_CAT == "Óbito pelo agravo")
+letalidade     <- n_obito_agravo / n_conf * 100
+
+atraso <- zika |>
+  mutate(atraso_dias = as.numeric(DT_NOTIFIC - DT_SIN_PRI)) |>
+  filter(between(atraso_dias, 0, 365))
+med_atraso <- median(atraso$atraso_dias)
+pct_7d     <- mean(atraso$atraso_dias <= 7) * 100
+
+compl_raca <- mean(!zika$RACA %in% c("Ignorado", "Sem informação")) * 100
+```
+
+# Destaques {-}
+
+- Entre `r params$ano_inicio` e `r params$ano_fim`, foram registradas **`r fmt_n(n_not)` notificações** de zika no Brasil, das quais **`r fmt_n(n_conf)` (`r fmt_p(pct_conf)`) foram confirmadas**.
+- O maior volume ocorreu em **`r ano_pico`**, com `r fmt_n(n_pico)` notificações e incidência de **`r fmt_d(inc_pico)` casos confirmados por 100 mil habitantes**. A UF com maior incidência naquele ano foi **`r uf_top_pico$UF`** (`r fmt_d(uf_top_pico$inc)`/100 mil).
+- Em **`r ano_ult`**, foram `r fmt_n(conf_ult)` casos confirmados (incidência de `r fmt_d(inc_ult, 2)`/100 mil)`r if (!is.na(var_ult)) paste0(", variação de ", fmt_p(var_ult), " em relação a ", ano_ult - 1) else ""`.
+- Foram confirmados **`r fmt_n(n_gest_conf)` casos em gestantes** no período.
+- A mediana entre o início dos sintomas e a notificação foi de **`r fmt_d(med_atraso, 0)` dias**, e `r fmt_p(pct_7d)` dos casos foram notificados em até 7 dias.
+
+# Introdução
+
+A zika é uma arbovirose causada pelo vírus Zika (ZIKV), um flavivírus transmitido principalmente pela picada de mosquitos do gênero *Aedes*, em especial o *Aedes aegypti*. Também há transmissão vertical (da gestante para o feto) e sexual. Na maioria das pessoas a infecção é assintomática ou causa um quadro leve, com exantema, febre baixa, conjuntivite e dores articulares.
+
+A importância da doença para a saúde pública está nas complicações. A infecção na gestação está associada à síndrome congênita do Zika, cuja manifestação mais conhecida é a microcefalia, e a infecção também está associada à síndrome de Guillain-Barré. Depois da epidemia de 2015–2016, o Brasil declarou Emergência em Saúde Pública de Importância Nacional (novembro de 2015), e a zika passou a ser de notificação compulsória no SINAN.
+
+Este boletim descreve o perfil epidemiológico das notificações de zika no Brasil entre `r params$ano_inicio` e `r params$ano_fim`.
+
+# Métodos
+
+Este é um **estudo descritivo** com dados secundários.
+
+- **Fonte dos casos:** Sistema de Informação de Agravos de Notificação (SINAN), extraído do DATASUS com o pacote `microdatasus`.
+- **Fonte da população:** estimativas populacionais municipais do IBGE (SIDRA, tabela 6579).
+  `r if (length(anos_pop_imputados)) paste0("Para os anos sem estimativa disponível (", paste(anos_pop_imputados, collapse = ", "), "), a população foi obtida por interpolação linear entre os anos adjacentes de cada município.") else ""`
+- **Unidade de análise:** notificações individuais. Os casos foram atribuídos ao **município de residência**.
+- **Referência temporal:** ano e mês de **início dos sintomas**. Quando essa data estava ausente, usou-se a data de notificação.
+- **Caso confirmado:** notificação com classificação final "Confirmado".
+- **Indicadores:**
+
+$$\text{Incidência} = \frac{\text{casos confirmados}}{\text{população residente}} \times 100.000$$
+
+$$\text{Letalidade} = \frac{\text{óbitos pelo agravo}}{\text{casos confirmados}} \times 100$$
+
+- **Oportunidade da notificação:** dias entre o início dos sintomas e a notificação, considerando intervalos de 0 a 365 dias.
+- **Completude:** percentual de registros com informação válida, ou seja, diferente de ausente ou "Ignorado".
+- **Análise:** R (`tidyverse`, `geobr`, `sf`). Malhas territoriais do IBGE (2020).
+
+# Panorama geral
+
+```{r tab-panorama}
+classes <- c("Confirmado", "Descartado", "Inconclusivo", "Sem informação", "Outras")
+
+panorama <- zika |>
+  mutate(CLASSIFICACAO = factor(CLASSIFICACAO, levels = classes)) |>
+  count(ANO, CLASSIFICACAO, .drop = FALSE) |>
+  complete(ANO = anos, CLASSIFICACAO, fill = list(n = 0)) |>
+  pivot_wider(names_from = CLASSIFICACAO, values_from = n) |>
+  mutate(Notificações = rowSums(across(all_of(classes)))) |>
+  left_join(select(inc_br, ANO, inc), by = "ANO")
+
+# Remove "Outras" se estiver zerada
+if (sum(panorama$Outras) == 0) panorama <- select(panorama, -Outras)
+
+total <- panorama |>
+  summarise(across(-c(ANO, inc), sum)) |>
+  mutate(ANO = "Total", inc = NA)
+
+bind_rows(mutate(panorama, ANO = as.character(ANO)), total) |>
+  mutate(across(-c(ANO, inc), fmt_n),
+         inc = if_else(is.na(inc), "—", fmt_d(inc, 2))) |>
+  relocate(Notificações, .after = ANO) |>
+  rename(Ano = ANO, `Incidência (/100 mil)` = inc) |>
+  kable(align = c("l", rep("r", ncol(panorama) - 1)),
+        caption = "Tabela 1. Notificações de zika segundo classificação final e incidência de casos confirmados, por ano de início dos sintomas. Brasil.")
+```
+
+Podemos ver como a incidência no ano da epidemia (2016) foi muito maior que nos demais anos da série. Isso deixa claro a magnitude da Epidemia de Zika naquele ano.
+
+# Tendência temporal
+
+```{r fig-tendencia, fig.cap="Figura 1. Notificações de zika por ano de início dos sintomas, segundo classificação final. Brasil."}
+zika |>
+  count(ANO, CLASSIFICACAO) |>
+  mutate(CLASSIFICACAO = factor(CLASSIFICACAO, levels = classes)) |>
+  ggplot(aes(x = ANO, y = n, fill = CLASSIFICACAO)) +
+  geom_col(width = 0.8) +
+  scale_fill_manual(values = cores_classif, drop = TRUE) +
+  scale_x_continuous(breaks = anos) +
+  scale_y_continuous(labels = lab_n) +
+  labs(x = "Ano de início dos sintomas", y = "Notificações",
+       fill = NULL, caption = fonte_sinan)
+```
+
+Nesta figura é importante notar que nos anos após a epidemia a maioria dos casos suspeitos são classifcados como "Descartado". Isso pode estar associado a coincidência de sintomas com outros agravos (dengue, chinkunguya, gripes). Outra hipótese é que o sistema de vigilância está configurado para ter alta sensibilidade.
+
+```{r fig-incidencia, fig.cap="Figura 2. Incidência de zika (casos confirmados por 100 mil habitantes) por ano de início dos sintomas. Brasil."}
+ggplot(inc_br, aes(x = ANO, y = inc)) +
+  geom_line(linewidth = 1, color = cor_principal) +
+  geom_point(size = 2.5, color = cor_principal) +
+  geom_text(aes(label = fmt_d(inc, 1)), vjust = -0.9, size = 3.2) +
+  scale_x_continuous(breaks = anos) +
+  scale_y_continuous(labels = lab_n, expand = expansion(mult = c(0.02, 0.15))) +
+  labs(x = "Ano de início dos sintomas", y = "Incidência por 100 mil hab.",
+       caption = fonte_inc)
+```
+
+Nesta imagem fica ainda mais evidente como a epidemia de 2016 foi um ponto fora da curva.
+
+# Sazonalidade
+
+```{r fig-sazonal, fig.height=5.5, fig.cap="Figura 3. Notificações de zika por mês e ano de início dos sintomas (escala logarítmica). Brasil."}
+zika |>
+  filter(!is.na(DT_SIN_PRI)) |>
+  count(ANO, MES) |>
+  ggplot(aes(x = MES, y = factor(ANO), fill = n)) +
+  geom_tile(color = "white") +
+  scale_x_continuous(breaks = 1:12,
+                     labels = c("Jan", "Fev", "Mar", "Abr", "Mai", "Jun",
+                                "Jul", "Ago", "Set", "Out", "Nov", "Dez"),
+                     expand = c(0, 0)) +
+  scale_fill_viridis_c(option = "C", trans = "log10", labels = lab_n,
+                       name = "Notificações") +
+  labs(x = "Mês de início dos sintomas", y = NULL, caption = fonte_sinan) +
+  theme(panel.grid = element_blank(),
+        legend.key.width = unit(1.5, "cm"))
+```
+
+A incidência de Zika parece ser maior entre Janeiro e Maio, embora em alguns anos se prolongue até Julho. Este período coincide com o ciclo de vida do *Aedes*.
+
+# Distribuição espacial
+
+```{r fig-mapa, fig.height=8.5, fig.cap="Figura 4. Incidência de zika (casos confirmados por 100 mil habitantes) por UF de residência e ano de início dos sintomas. Brasil."}
+quebras <- c(-Inf, 0, 1, 10, 50, 100, 300, Inf)
+rotulos <- c("0", "> 0–1", "> 1–10", "> 10–50", "> 50–100", "> 100–300", "> 300")
+
+ufs_geo |>
+  left_join(select(inc_uf, COD_UF, ANO, inc), by = "COD_UF") |>
+  mutate(classe = cut(inc, breaks = quebras, labels = rotulos)) |>
+  ggplot() +
+  geom_sf(aes(fill = classe), color = "white", linewidth = 0.15) +
+  facet_wrap(~ ANO, ncol = 4) +
+  scale_fill_viridis_d(option = "C", direction = -1, drop = FALSE,
+                       name = "Incidência por 100 mil hab.") +
+  labs(caption = fonte_inc) +
+  theme_void() +
+  theme(strip.text = element_text(face = "bold"),
+        legend.position = "bottom",
+        plot.caption = element_text(hjust = 1)) +
+  guides(fill = guide_legend(nrow = 1))
+```
+
+
+Podemos verificar que alguns Estados se mantém no topo da incidência ao longo do tempo, notavelmente Mato grosso, Tocantins e Bahia.
+
+```{r tab-uf}
+inc_uf |>
+  filter(ANO == ano_pico) |>
+  slice_max(inc, n = 10, with_ties = FALSE) |>
+  arrange(desc(inc)) |>
+  transmute(`Posição` = row_number(), UF, `Região` = REGIAO,
+            Casos = fmt_n(casos), `População` = fmt_n(populacao),
+            `Incidência (/100 mil)` = fmt_d(inc)) |>
+  kable(align = c("c", "l", "l", "r", "r", "r"),
+        caption = paste0("Tabela 2. As 10 UFs com maior incidência de zika em ", ano_pico, " (ano de pico)."))
+```
+
+```{r ranking-mun, results="asis"}
+ranking_mun <- function(ano_ref, n = 10) {
+  casos_mun |>
+    filter(ANO == ano_ref, casos >= params$min_casos_ranking) |>
+    left_join(pop_mun, by = c("ID_MN_RESI", "ANO")) |>
+    filter(populacao > 0) |>
+    mutate(inc = casos / populacao * 1e5) |>
+    slice_max(inc, n = n, with_ties = FALSE) |>
+    arrange(desc(inc)) |>
+    left_join(mun_nomes, by = "ID_MN_RESI") |>
+    transmute(`Posição` = row_number(),
+              `Município` = coalesce(MUNICIPIO, ID_MN_RESI), UF,
+              Casos = fmt_n(casos), `População` = fmt_n(populacao),
+              `Incidência (/100 mil)` = fmt_d(inc))
+}
+
+for (a in unique(c(ano_pico, ano_ult))) {
+  tb <- ranking_mun(a)
+  if (nrow(tb) == 0) {
+    cat("\n\nEm", a, "nenhum município atingiu o mínimo de",
+        params$min_casos_ranking, "casos confirmados para o ranking.\n\n")
+  } else {
+    cat("\n\n")
+    print(kable(tb, align = c("c", "l", "l", "r", "r", "r"),
+                caption = paste0("Municípios com maior incidência de zika em ", a,
+                                 " (mínimo de ", params$min_casos_ranking,
+                                 " casos confirmados).")))
+    cat("\n\n")
+  }
+}
+```
+
+Ranqueamos os munícipios em 2 anos da série para compararmos as fotografias durante a epidemia e em um ano mais recente. Filtramos apenas municípios que tiveram pelo menos 5 casos para evitar distorções causadas por populações muito pequenas.
+
+# Trajetórias municipais da zika
+
+Para entender o que aconteceu com a transmissão depois da epidemia, os municípios foram classificados comparando os casos confirmados nos três primeiros anos da série (período epidêmico) com os casos dos três últimos anos (período recente). Foi exigido um mínimo de 3 casos confirmados em cada janela.
+
+```{r geo-mun, cache=TRUE}
+mun_geo <- geobr::read_municipality(year = 2020, simplified = TRUE, showProgress = FALSE) |>
+  transmute(ID_MN_RESI = substr(as.character(code_muni), 1, 6))
+```
+
+```{r tipologia}
+periodo_epi <- params$ano_inicio:(params$ano_inicio + 2)
+periodo_rec <- (params$ano_fim - 2):params$ano_fim
+min_c       <- 3
+
+niveis_tipo <- c("Persistente", "Emergente", "Epidemia passada",
+                 "Esporádico", "Sem casos confirmados")
+cores_tipo  <- c("Persistente"           = "#B2182B",
+                 "Emergente"             = "#F4A11D",
+                 "Epidemia passada"      = "#4393C3",
+                 "Esporádico"            = "#C7DDEA",
+                 "Sem casos confirmados" = "grey92")
+
+tipologia <- pop_mun |>
+  filter(ANO == params$ano_fim) |>
+  select(ID_MN_RESI, populacao) |>
+  left_join(
+    casos_mun |>
+      group_by(ID_MN_RESI) |>
+      summarise(c_epi = sum(casos[ANO %in% periodo_epi]),
+                c_rec = sum(casos[ANO %in% periodo_rec]),
+                c_tot = sum(casos),
+                anos_ativos = n_distinct(ANO),
+                .groups = "drop"),
+    by = "ID_MN_RESI"
+  ) |>
+  mutate(
+    across(c(c_epi, c_rec, c_tot, anos_ativos), \(x) replace_na(x, 0)),
+    tipo = case_when(
+      c_tot == 0                        ~ "Sem casos confirmados",
+      c_epi >= min_c & c_rec >= min_c   ~ "Persistente",
+      c_epi <  min_c & c_rec >= min_c   ~ "Emergente",
+      c_epi >= min_c                    ~ "Epidemia passada",
+      TRUE                              ~ "Esporádico"
+    ),
+    tipo = factor(tipo, levels = niveis_tipo),
+    inc_rec = c_rec / populacao / length(periodo_rec) * 1e5   # média anual recente
+  )
+
+n_emerg   <- sum(tipologia$tipo == "Emergente")
+pop_emerg <- sum(tipologia$populacao[tipologia$tipo == "Emergente"])
+n_persis  <- sum(tipologia$tipo == "Persistente")
+```
+
+```{r tab-tipologia}
+tipologia |>
+  group_by(Tipo = tipo) |>
+  summarise(`Municípios` = n(),
+            `População`  = sum(populacao),
+            `Casos no período recente` = sum(c_rec),
+            .groups = "drop") |>
+  mutate(`% municípios` = fmt_d(`Municípios` / sum(`Municípios`) * 100),
+         `% população`  = fmt_d(`População` / sum(`População`) * 100),
+         across(c(`Municípios`, `População`, `Casos no período recente`), fmt_n)) |>
+  select(Tipo, `Municípios`, `% municípios`, `População`, `% população`,
+         `Casos no período recente`) |>
+  kable(align = c("l", rep("r", 5)),
+        caption = paste0("Tabela. Tipologia dos municípios segundo a trajetória da zika: período epidêmico (",
+                         min(periodo_epi), "–", max(periodo_epi), ") × período recente (",
+                         min(periodo_rec), "–", max(periodo_rec), ")."))
+```
+
+```{r fig-tipologia, fig.height=7.5, fig.cap="Figura. Tipologia dos municípios brasileiros segundo a trajetória da zika."}
+mun_geo |>
+  left_join(select(tipologia, ID_MN_RESI, tipo), by = "ID_MN_RESI") |>
+  mutate(tipo = replace_na(as.character(tipo), "Sem casos confirmados"),
+         tipo = factor(tipo, levels = niveis_tipo)) |>
+  ggplot() +
+  geom_sf(aes(fill = tipo), color = NA) +
+  geom_sf(data = ufs_geo, fill = NA, color = "grey40", linewidth = 0.25) +
+  scale_fill_manual(values = cores_tipo, name = NULL, drop = FALSE) +
+  labs(caption = fonte_inc) +
+  theme_void() +
+  theme(legend.position = "bottom") +
+  guides(fill = guide_legend(nrow = 2))
+```
+
+```{r tab-emergentes}
+tipologia |>
+  filter(tipo == "Emergente") |>
+  slice_max(inc_rec, n = 10, with_ties = FALSE) |>
+  left_join(mun_nomes, by = "ID_MN_RESI") |>
+  transmute(`Município` = coalesce(MUNICIPIO, ID_MN_RESI), UF,
+            `Casos na epidemia` = fmt_n(c_epi),
+            `Casos recentes` = fmt_n(c_rec),
+            `Incidência média anual recente (/100 mil)` = fmt_d(inc_rec)) |>
+  kable(align = c("l", "l", "r", "r", "r"),
+        caption = "Tabela. Municípios emergentes com maior incidência recente de zika.")
+```
+
+Foram identificados **`r fmt_n(n_emerg)` municípios emergentes**, onde vivem `r fmt_n(pop_emerg)` pessoas, e **`r fmt_n(n_persis)` municípios com transmissão persistente**. Os emergentes quase não registraram casos durante a epidemia, então é provável que sua população tenha baixa imunidade ao vírus. Isso os torna prioritários para o controle vetorial e para o acompanhamento de gestantes.
+
+
+# Perfil dos casos confirmados
+
+```{r tab-perfil}
+tab_var <- function(df, var, nome) {
+  df |>
+    count(Categoria = as.character({{ var }})) |>
+    mutate(Categoria = replace_na(Categoria, "Sem informação"),
+           `%` = fmt_d(n / sum(n) * 100),
+           n = fmt_n(n),
+           `Variável` = nome) |>
+    relocate(`Variável`)
+}
+
+bind_rows(
+  tab_var(conf, SEXO, "Sexo"),
+  tab_var(conf, FAIXA, "Faixa etária (anos)"),
+  tab_var(conf, RACA, "Raça/cor")
+) |>
+  mutate(`Variável` = if_else(`Variável` == lag(`Variável`, default = ""), "", `Variável`)) |>
+  kable(align = c("l", "l", "r", "r"),
+        caption = "Tabela 3. Características sociodemográficas dos casos confirmados de zika. Brasil.")
+```
+
+```{r fig-piramide, fig.height=5, fig.cap="Figura 5. Casos confirmados de zika por sexo e faixa etária. Brasil."}
+conf |>
+  filter(SEXO %in% c("Masculino", "Feminino"), !is.na(FAIXA)) |>
+  count(FAIXA, SEXO) |>
+  mutate(n_plot = if_else(SEXO == "Masculino", -n, n)) |>
+  ggplot(aes(x = FAIXA, y = n_plot, fill = SEXO)) +
+  geom_col(width = 0.8) +
+  coord_flip() +
+  scale_y_continuous(labels = \(x) lab_n(abs(x))) +
+  scale_fill_manual(values = c(Feminino = "#C0504D", Masculino = cor_principal)) +
+  labs(x = "Faixa etária (anos)", y = "Casos confirmados", fill = NULL,
+       caption = fonte_sinan)
+```
+
+
+Podemos notar que o perfil mais comum são **Mulheres em Idade Fértil**. O que é um grande problema, já que a maior intercorrência relacionada a Zika é a microcefalia.
+
+# Zika em gestantes
+
+```{r tab-gestacao}
+conf |>
+  filter(SEXO == "Feminino", between(IDADE, 10, 49)) |>
+  count(`Situação gestacional` = GESTACAO) |>
+  mutate(ordem = case_when(str_detect(`Situação gestacional`, "trimestre") ~ 1,
+                           str_detect(`Situação gestacional`, "gestacional") ~ 2,
+                           TRUE ~ 3)) |>
+  arrange(ordem, `Situação gestacional`) |>
+  mutate(`%` = fmt_d(n / sum(n) * 100), n = fmt_n(n)) |>
+  select(-ordem) |>
+  kable(align = c("l", "r", "r"),
+        caption = "Tabela 4. Casos confirmados de zika em mulheres de 10 a 49 anos, segundo situação gestacional. Brasil.")
+```
+
+A completude dos dados dificulta a análise. Mas podemos ver que o diagnóstico é mais comum a partir do 2º Trimestre.
+
+```{r fig-gestantes, fig.cap="Figura 6. Casos confirmados de zika em gestantes, segundo idade gestacional, por ano de início dos sintomas. Brasil."}
+conf |>
+  filter(GESTANTE) |>
+  count(ANO, GESTACAO) |>
+  ggplot(aes(x = ANO, y = n, fill = GESTACAO)) +
+  geom_col(width = 0.8) +
+  scale_x_continuous(breaks = anos) +
+  scale_y_continuous(labels = lab_n) +
+  scale_fill_brewer(palette = "Set2") +
+  labs(x = "Ano de início dos sintomas", y = "Casos confirmados",
+       fill = NULL, caption = fonte_sinan)
+```
+
+# Evolução dos casos
+
+```{r tab-evolucao}
+conf |>
+  count(`Evolução` = EVOLUCAO_CAT, sort = TRUE) |>
+  mutate(`%` = fmt_d(n / sum(n) * 100), n = fmt_n(n)) |>
+  kable(align = c("l", "r", "r"),
+        caption = "Tabela 5. Evolução dos casos confirmados de zika. Brasil.")
+```
+
+No período foram registrados **`r fmt_n(n_obito_agravo)` óbitos pelo agravo** entre os casos confirmados, o que corresponde a uma letalidade de **`r fmt_d(letalidade, 3)`%**.
+
+Ou seja, a letalidade é baixa. Mas como citado anteriormente, o problema maior que a Zika causa é a microcefalia. Não temos dados para identificar quais dos casos tiveram este desfecho.
+
+# Oportunidade da notificação
+
+```{r tab-oportunidade}
+atraso |>
+  group_by(Ano = ANO) |>
+  summarise(Registros = fmt_n(n()),
+            `Mediana (dias)` = fmt_d(median(atraso_dias), 0),
+            `IIQ (dias)` = paste0(fmt_d(quantile(atraso_dias, .25), 0), "–",
+                                  fmt_d(quantile(atraso_dias, .75), 0)),
+            `% em até 7 dias` = fmt_d(mean(atraso_dias <= 7) * 100),
+            .groups = "drop") |>
+  kable(align = c("l", "r", "r", "r", "r"),
+        caption = "Tabela 6. Tempo entre o início dos sintomas e a notificação de zika, por ano. Brasil.")
+```
+
+```{r fig-oportunidade, fig.cap="Figura 7. Distribuição do tempo (dias) entre o início dos sintomas e a notificação, por ano. Brasil."}
+ggplot(atraso, aes(x = factor(ANO), y = atraso_dias)) +
+  geom_boxplot(outlier.shape = NA, fill = "#DCE9F5", color = cor_principal) +
+  geom_hline(yintercept = 7, linetype = "dashed", color = "grey40") +
+  coord_cartesian(ylim = c(0, 40)) +
+  labs(x = "Ano de início dos sintomas", y = "Dias", caption = fonte_sinan)
+```
+
+Como podemos ver, nos anos da epidemia a notificação foi muito mais rápida que nos anos anteriores. Além disso, nos anos da pandemia de Covid houve uma piora considerável. 
+
+# Qualidade dos dados
+
+```{r fig-completude, fig.height=5, fig.cap="Figura 8. Completude (%) de variáveis selecionadas das notificações de zika, por ano. Brasil."}
+completude <- zika |>
+  transmute(
+    ANO,
+    `Data de início dos sintomas` = !is.na(DT_SIN_PRI),
+    `Município de residência`     = !is.na(ID_MN_RESI) & nchar(ID_MN_RESI) == 6,
+    `Sexo`                        = SEXO %in% c("Masculino", "Feminino"),
+    `Idade`                       = !is.na(IDADE),
+    `Raça/cor`                    = !RACA %in% c("Ignorado", "Sem informação"),
+    `Classificação final`         = CLASSIFICACAO %in% c("Confirmado", "Descartado", "Inconclusivo"),
+    `Evolução`                    = !EVOLUCAO_CAT %in% c("Ignorado", "Sem informação"),
+    `Gestação (mulheres 10–49)`   = if_else(SEXO == "Feminino" & between(IDADE, 10, 49),
+                                            !GESTACAO %in% c("Ignorado", "Sem informação"),
+                                            NA)
+  ) |>
+  pivot_longer(-ANO, names_to = "variavel", values_to = "valido") |>
+  group_by(ANO, variavel) |>
+  summarise(pct = mean(valido, na.rm = TRUE) * 100, .groups = "drop")
+
+ggplot(completude, aes(x = factor(ANO), y = variavel, fill = pct)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = fmt_d(pct, 0)), size = 3) +
+  scale_fill_gradient2(low = "#C0504D", mid = "#F7E08C", high = "#9BBB59",
+                       midpoint = 80, limits = c(0, 100), name = "Completude (%)") +
+  labs(x = "Ano", y = NULL, caption = fonte_sinan) +
+  theme(panel.grid = element_blank())
+```
+
+Em todo o período, o campo **raça/cor** teve `r fmt_p(compl_raca)` de preenchimento válido.
+
+O campo Evolução teve uma baixa taxa de preenchimento. Isso implica que os desfechos registrados podem não representar adequadamente todos os casos. Isso limita análises sobre cura, óbito e outros desfechos.
+
+E o campo Gestação foi melhorando o preenchimento ao longo da série. Isso compromete análises, principalmente no período da epidemia.
+
+
+# Considerações finais
+
+```{r texto-final, results="asis"}
+cat(paste0(
+  "Entre ", params$ano_inicio, " e ", params$ano_fim, ", a zika teve seu maior volume de notificações em ",
+  ano_pico, ", com incidência de ", fmt_d(inc_pico), " casos confirmados por 100 mil habitantes. ",
+  "Em ", ano_ult, ", a incidência foi de ", fmt_d(inc_ult, 2), "/100 mil. ",
+  "A distribuição mensal mostra o padrão sazonal das notificações ao longo do ano (Figura 3), ",
+  "e o padrão espacial está na Figura 4.\n\n",
+  "Foram confirmados ", fmt_n(n_gest_conf), " casos em gestantes. Esse grupo continua prioritário ",
+  "para a vigilância, por causa do risco de síndrome congênita do Zika.\n\n"
+))
+```
+
+**Limitações**
+
+- **Subnotificação.** Uma alta proporção de infecções é assintomática ou leve, e esses casos tendem a não procurar atendimento.
+- **Diagnóstico.** Os sintomas se sobrepõem aos da dengue e da chikungunya. Também há reação cruzada sorológica entre flavivírus e muitos casos são confirmados por critério clínico-epidemiológico.
+- **Dados recentes.** Os anos mais recentes podem estar preliminares e sujeitos a revisão.
+- **Completude.** O preenchimento é incompleto em variáveis como raça/cor, evolução e situação gestacional.
+- **População.** As estimativas populacionais foram interpoladas nos anos sem dados oficiais.
+- **Desfechos congênitos.** A síndrome congênita do Zika não é registrada nesta ficha do SINAN, e seus desfechos não estão representados aqui.
+
+**Recomendações**
+
+- Fortalecer o controle vetorial integrado com dengue e chikungunya, intensificando as ações antes do período sazonal.
+- Priorizar a investigação laboratorial e o acompanhamento de gestantes com suspeita de zika.
+- Qualificar o preenchimento das fichas, principalmente evolução, raça/cor e situação gestacional.
+- Aumentar a proporção de notificações feitas em até 7 dias do início dos sintomas.
+
+---
+
+*Notas técnicas: dados do SINAN extraídos via `microdatasus`. População das estimativas do IBGE (SIDRA 6579) e malhas territoriais do IBGE (2020) via `geobr`. Processado em `r format(Sys.time(), '%d/%m/%Y %H:%M')`.*
+*Nota: na base do SINAN, o código de óbito pelo agravo aparece rotulado como "Óbito por dengue", herdado da ficha de arboviroses. Esses registros foram considerados óbitos pelo agravo notificado (zika).*

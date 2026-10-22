@@ -1,0 +1,40 @@
+---
+title: "Boletim epidemiologico - Zika no Brasil"
+lang: pt-BR
+output: html_document
+---
+
+```{r verificar-implementacao, include=FALSE}
+stop(
+  "Relatorio ainda nao implementado. O original permanece em ",
+  "boletim_zika_v2.Rmd, na raiz do projeto.",
+  call. = FALSE
+)
+```
+
+# Estado do documento
+
+Este arquivo reserva o local do futuro relatorio organizado.
+Nao contem resultados novos nem substitui o boletim original.
+
+# Introducao
+
+A preencher durante a migracao.
+
+# Metodos
+
+Documentar fontes, data de extracao, populacao estudada, criterios de selecao,
+referencia temporal, recodificacoes, denominadores e tratamento de ausencias.
+
+# Resultados
+
+Incluir somente resultados gerados pelo fluxo validado.
+
+# Limitacoes
+
+Discutir qualidade dos registros, subnotificacao, mudancas na vigilancia,
+incerteza dos denominadores e limites das interpretacoes descritivas.
+
+# Referencias
+
+Incluir os dicionarios e documentos tecnicos utilizados.

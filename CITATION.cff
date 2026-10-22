@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "Metadados preliminares: confirme a autoria e a versao antes de citar."
+title: "Zika no Brasil: boletim epidemiologico e codigo de analise"
+type: software
+authors:
+  - family-names: "Cunha"
+    given-names: "Breno Eduardo Lomazzi"
+  - family-names: "de Souza"
+    given-names: "Vinicius Becker"
+abstract: >-
+  Projeto em organizacao para analise descritiva das notificacoes de zika
+  no Brasil entre 2015 e 2025, com dados do SINAN/DATASUS e do IBGE.
+keywords:
+  - Zika
+  - SINAN
+  - epidemiologia
+  - R
